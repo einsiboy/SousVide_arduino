@@ -12,8 +12,8 @@
 #include "U8glib.h"
 
 // PID Library
-//#include <PID_v1.h>
-//#include <PID_AutoTune_v0.h>
+#include <PID_v1.h>
+#include <PID_AutoTune_v0.h>
 
 // Libraries for the DS18B20 Temperature Sensor
 #include <OneWire.h>
@@ -27,9 +27,9 @@
 // ==== States =======================
 //====================================
 //enum OperatingState { OFF = 0, SETP, RUN, TUNE_KP, TUNE_KI, TUNE_KD, AUTO};
-enum OperatingState {SETP, RUN, TUNE_KP, TUNE_KI, TUNE_KD, AUTO};
-//operatingState opState = OFF;
-OperatingState opState = RUN;
+enum OperatingState {OFF, SETP, RUN, TUNE_KP, TUNE_KI, TUNE_KD, AUTO};
+OperatingState opState = OFF;
+//OperatingState opState = RUN;
 
 // ===================================
 // ==== Sensor =======================
@@ -77,11 +77,24 @@ const int KiAddress = 16;
 const int KdAddress = 24;
 
 //Specify the links and initial tuning parameters
-//PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+PID myPID(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 
 // 10 second Time Proportional Output window
 int WindowSize = 10000; 
 unsigned long windowStartTime;
+
+// ===================================
+// ==== Autotune variables ===========
+//====================================
+byte ATuneModeRemember=2;
+
+double aTuneStep=500;
+double aTuneNoise=1;
+unsigned int aTuneLookBack=20;
+
+boolean tuning = false;
+
+PID_ATune aTune(&input, &output);
 
 
 // ===============================
@@ -104,6 +117,9 @@ unsigned long lastInput = 0; // last button press
 unsigned long textOnTime = millis();
 unsigned long textOffTime = millis();
 boolean drawRunTitle = true;
+
+const int logInterval = 10000; // log every 10 seconds
+long lastLogTime = 0;
 
 // ===============================
 // ==== Strings ==================
@@ -134,6 +150,18 @@ void setup() {
   sensors.setWaitForConversion(false);
 
   loadParameters();
+
+  myPID.SetTunings(Kp,Ki,Kd);
+
+  myPID.SetSampleTime(1000);
+  myPID.SetOutputLimits(0, WindowSize);
+  
+  // Run timer2 interrupt every 15 ms 
+  TCCR2A = 0;
+  TCCR2B = 1<<CS22 | 1<<CS21 | 1<<CS20;
+  
+  //Timer2 Overflow Interrupt Enable
+  TIMSK2 |= 1<<TOIE2;
 }
 
 void loadParameters(){
@@ -162,14 +190,17 @@ void loop() {
     /*if(isButtonPressed()){
       lastInput = millis();
     }*/
-    doControl();
+    if(!(opState == OFF)){
+      doControl();
+    }
+    
     display.firstPage();  
     do {
      switch (opState)
      {
-     //case OFF:
-        //Off();
-     //   break;
+     case OFF:
+        Off();
+        break;
      case SETP:
         tuneSp();
         break;
@@ -199,8 +230,53 @@ void drawTitleString(const char* titleStr){
   int x = 0;
 
   y += fontHeight; //starts drawing from lower left of string
-  display.drawStr(x, y, titleStr);
+  display.setPrintPos(x, y);
+  display.print(titleStr);
 }
+
+// ===================================
+// ==== Off state ====================
+//====================================
+
+
+void Off()
+{
+  updateOff();
+  drawOff();
+}
+
+void updateOff(){
+  digitalWrite(RelayPin, LOW);  // make sure it is off
+  myPID.SetMode(MANUAL);
+  
+  if(!digitalRead(BUTTON_RIGHT)){
+    sensors.requestTemperatures(); // Start an asynchronous temperature reading
+    
+    //turn the PID on
+    myPID.SetMode(AUTOMATIC);
+    windowStartTime = millis();
+    
+    opState = RUN;
+    delay(200);
+  }
+}
+
+void drawOff(){
+  drawTitleString("Off"); 
+  
+  int x, y, fontHeight;
+  display.setFont(u8g_font_7x13);
+  fontHeight = display.getFontAscent()-display.getFontDescent(); // used as offset
+
+  y = 0.3*display.getHeight() + fontHeight;
+  x = 0.075*display.getWidth();
+  display.setPrintPos(x, y);
+  display.print("Press right");
+  y += fontHeight;
+  display.setPrintPos(x,y);
+  display.print("to start");
+}
+
 
 // ===================================
 // ==== Running state ================
@@ -216,21 +292,23 @@ void Run(){
 }
 
 void updateRun(){
-   //SaveParameters();
-   //myPID.SetTunings(Kp,Ki,Kd);
+   SaveParameters();
+   myPID.SetTunings(Kp,Ki,Kd);
 
   if(!digitalRead(BUTTON_SELECT) 
      && !digitalRead(BUTTON_RIGHT) ) { // only allow autotune if close to steady state
-      if(abs(input - setpoint) < 1.0){
+      if(abs(input - setpoint) < 1.5){
         startAutoTune();
       } else {
         Serial.println("Can't start autotune, not within 1.0 °C of setpoint");
+        delay(200);
       }
-  } else if(updateStateChange(TUNE_KD, SETP)) {
+  } else if(updateStateChange(OFF, SETP)) {
     delay(200);
     return;
   }
 
+  // Have the title text blink while running.
   if(millis() - textOnTime > 2000 && drawRunTitle){
     drawRunTitle = false;
     textOffTime = millis();
@@ -239,21 +317,35 @@ void updateRun(){
     drawRunTitle = true;
     textOnTime = millis();
   }
-  
+
+  // periodically log to serial port in csv format
+  if (millis() - lastLogTime > logInterval)  
+  {
+    Serial.print(input);
+    Serial.print(",");
+    Serial.print(output);
+    Serial.print(",");
+    Serial.print(setpoint);
+    Serial.print(",");
+    Serial.println(tuning);
+    lastLogTime = millis();
+  }
 }
 
 void drawRun(){
   if(drawRunTitle){
     drawTitleString("Running");
+    if(tuning){
+      display.print(" - T");    
+    }
   }
-  
   
   int x, y, fontHeight;
   display.setFont(u8g_font_7x13);
   fontHeight = display.getFontAscent()-display.getFontDescent(); // used as offset
 
   y = 0.3*display.getHeight() + fontHeight;
-  x = 0.075*display.getWidth();
+  x = 0.0675*display.getWidth();
   display.setPrintPos(x, y);
   display.print("Target: ");
   display.print(setpoint);
@@ -261,12 +353,18 @@ void drawRun(){
   display.print("C");
 
   y += fontHeight+1;
-  x -= 3;
+  //x -= 3;
   display.setPrintPos(x, y);
   display.print("Current: "); 
   display.print(input);
   display.print((char)176);
   display.print("C");
+  
+  y += fontHeight+1;
+  float pct = map(output, 0, WindowSize, 0, 1000);
+  display.setPrintPos(x, y);
+  display.print(pct/10);
+  display.print("%");
 }
 
 // ===================================
@@ -379,12 +477,12 @@ void doControl()
     input = sensors.getTempC(tempSensor);
     sensors.requestTemperatures(); // prime the pump for the next one - but don't wait
   }
- /* 
+  
   if (tuning) // run the auto-tuner
   {
      if (aTune.Runtime()) // returns 'true' when done
      {
-        FinishAutoTune();
+        finishAutoTune();
      }
   }
   else // Execute control algorithm
@@ -393,15 +491,40 @@ void doControl()
   }
   
   // Time Proportional relay state is updated regularly via timer interrupt.
-  onTime = Output; 
-  */
+  onTime = output; 
+  
 }
 
 // =============================================
 // ======== Auto Tune ==========================
 // =============================================
 void startAutoTune(){
-  
+   // REmember the mode we were in
+   ATuneModeRemember = myPID.GetMode();
+
+   // set up the auto-tune parameters
+   aTune.SetNoiseBand(aTuneNoise);
+   aTune.SetOutputStep(aTuneStep);
+   aTune.SetLookbackSec((int)aTuneLookBack);
+   tuning = true;
+}
+
+
+void finishAutoTune()
+{
+   tuning = false;
+
+   // Extract the auto-tune calculated parameters
+   Kp = aTune.GetKp();
+   Ki = aTune.GetKi();
+   Kd = aTune.GetKd();
+
+   // Re-tune the PID and revert to normal control mode
+   myPID.SetTunings(Kp,Ki,Kd);
+   myPID.SetMode(ATuneModeRemember);
+   
+   // Persist any changed parameters to EEPROM
+   SaveParameters();
 }
 
 void drawTuningConstant(const char *constName, double constVar){
@@ -449,7 +572,6 @@ void updateSettingsScreen(double &constVar, float increment, float shiftFactor, 
 boolean updateStateChange(OperatingState leftOpState, OperatingState rightOpState){
   if (!digitalRead(BUTTON_LEFT))
   {
-    Serial.print("left button state change: "); Serial.println(leftOpState);
      opState = leftOpState;
      return true;
   }
@@ -482,6 +604,29 @@ void drawSousVide(void){
 }
 
 // ************************************************
+// Save any parameter changes to EEPROM
+// ************************************************
+void SaveParameters()
+{
+   if (setpoint != EEPROM_readDouble(SpAddress))
+   {
+      EEPROM_writeDouble(SpAddress, setpoint);
+   }
+   if (Kp != EEPROM_readDouble(KpAddress))
+   {
+      EEPROM_writeDouble(KpAddress, Kp);
+   }
+   if (Ki != EEPROM_readDouble(KiAddress))
+   {
+      EEPROM_writeDouble(KiAddress, Ki);
+   }
+   if (Kd != EEPROM_readDouble(KdAddress))
+   {
+      EEPROM_writeDouble(KdAddress, Kd);
+   }
+}
+
+// ************************************************
 // Write floating point values to EEPROM
 // ************************************************
 void EEPROM_writeDouble(int address, double value)
@@ -505,6 +650,43 @@ double EEPROM_readDouble(int address)
       *p++ = EEPROM.read(address++);
    }
    return value;
+}
+
+// ************************************************
+// Timer Interrupt Handler
+// ************************************************
+SIGNAL(TIMER2_OVF_vect) 
+{
+  if (opState == OFF)
+  {
+    digitalWrite(RelayPin, LOW);  // make sure relay is off
+  }
+  else
+  {
+    DriveOutput();
+  }
+}
+
+// ************************************************
+// Called by ISR every 15ms to drive the output
+// ************************************************
+void DriveOutput()
+{  
+  long now = millis();
+  // Set the output
+  // "on time" is proportional to the PID output
+  if(now - windowStartTime>WindowSize)
+  { //time to shift the Relay Window
+     windowStartTime += WindowSize;
+  }
+  if((onTime > 100) && (onTime > (now - windowStartTime)))
+  {
+     digitalWrite(RelayPin,HIGH);
+  }
+  else
+  {
+     digitalWrite(RelayPin,LOW);
+  }
 }
 
 
